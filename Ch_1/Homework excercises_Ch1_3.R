@@ -29,6 +29,7 @@ bs <- seq(min(goldp), max(goldp), length=129)
 
 # image(x, x, matrix(goldp, ncol=length(x)), col=cs, breaks=bs,
 #       xlab="x1", ylab="x2")
+contour(x, x, matrix(goldp, ncol=length(x)), add=FALSE)
 
 
 
