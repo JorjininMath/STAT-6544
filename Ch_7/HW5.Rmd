@@ -1,0 +1,559 @@
+---
+title: "HW5"
+author: "Jin Zhao"
+date: "2023-04-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Chapter 7
+
+## 1. Thompson sampling and probability of improvement
+
+Based on the requirements of the problem, we can outline 8 steps to clarify the necessary actions for later:
+
+1. Define the Goldstein-Price function and any necessary auxiliary functions.
+
+2. Create a modular implementation for optimization algorithms, which can handle different methods, such as "Nelder-Mead", "L-BFGS-B", EY, EI, and Thompson Sampling.
+
+3. For Thompson Sampling, implement the two variations:
+
+3a. Generate a size-100 Latin Hypercube Sample (LHS) in the [0, 1]^2 input space for each iteration of the search.
+
+3b. Generate a size-90 LHS in the [0, 1]^2 input space and augment it with ten candidates selected randomly from the smallest rectangle containing the best five inputs found so far.
+
+4. Implement the PI comparator.
+
+5. Run 100 repetitions of the optimization process using all seven comparators (Nelder-Mead, L-BFGS-B, EY, EI, and the two Thompson Sampling variations, and PI).
+
+6. For each repetition, track the best objective value (BOV) for each comparator.
+
+7. Calculate the average progress for each comparator across the 100 repetitions.
+
+8. Create boxplots for the best objective value (BOV) of all seven comparators across the 100 repetitions.
+
+
+For step 1, I implement the `Goldstein-Price` function and any necessary auxiliary functions in this part.
+```{r necessary_funcs}
+## libraries
+library(laGP)
+library(plgp)
+library(lhs)
+
+## Goldstein-Price function
+f <- function(X, lb=0, ub=1, inf=1e6)
+{
+  if(is.null(nrow(X))) X <- matrix(X, nrow=1)
+  m <- 8.6928
+  s <- 2.4269
+  x1 <- 4*X[,1] - 2
+  x2 <- 4*X[,2] - 2
+  a <- 1 + (x1 + x2 + 1)^2 * 
+    (19 - 14*x1 + 3*x1^2 - 14*x2 + 6*x1*x2 + 3*x2^2)
+  b <- 30 + (2*x1 - 3*x2)^2 * 
+    (18 - 32*x1 + 12*x1^2 + 48*x2 - 36*x1*x2 + 27*x2^2)
+  f <- log(a*b)
+  f <- (f - m)/s
+  
+  # add penalty term
+  if (any(X < lb) || any(X > ub)) {
+    return(inf)
+  } else {
+    return(f)
+  }
+}
+
+# fprime for `L-BFGS-B` and `Nelder-Mead`
+fprime <- function(x)
+ {
+  ynew <- f(x)
+  y1 <<- c(y1, ynew)
+  return(ynew)
+ }
+
+## EI, PI
+# EI
+EI <- function(gpi, x, fmin, pred=predGPsep)
+ {
+  if(is.null(nrow(x))) x <- matrix(x, nrow=1)
+  p <- pred(gpi, x, lite=TRUE)
+  d <- fmin - p$mean
+  sigma <- sqrt(p$s2)
+  dn <- d/sigma
+  ei <- d*pnorm(dn) + sigma*dnorm(dn)
+  return(ei)
+ }
+
+# PI
+PI <- function(gpi, x, fmin, pred=predGPsep)
+ {
+  if(is.null(nrow(x))) x <- matrix(x, nrow=1)
+  p <- pred(gpi, x, lite=TRUE)
+  d <- fmin - p$mean
+  sigma <- sqrt(p$s2)
+  dn <- d/sigma
+  pi <- pnorm(dn)
+  return(pi)
+}
+
+## objective functions
+obj.mean <- function(x, gpi)
+  predGPsep(gpi, matrix(x, nrow=1), lite=TRUE)$mean
+
+obj.ei <- function(x, fmin, gpi, pred=predGPsep)
+  -EI(gpi, x, fmin, pred)
+
+obj.pi <- function(x, fmin, gpi, pred=predGPsep)
+  -PI(gpi, x, fmin, pred)
+
+## search functions
+# EI.search
+eps <- sqrt(.Machine$double.eps)
+
+EI.search <- function(X, y, dim, gpi, pred=predGPsep, multi.start=5, tol=eps)
+ {
+  m <- which.min(y)
+  fmin <- y[m]
+  start <- matrix(X[m,], nrow=1)
+  if(multi.start > 1) 
+    start <- rbind(start, randomLHS(multi.start - 1, ncol(X)))
+  xnew <- matrix(NA, nrow=nrow(start), ncol=ncol(X)+1)
+  for(i in 1:nrow(start)) {
+    if(EI(gpi, start[i,], fmin) <= tol) { out <- list(value=-Inf); next }
+    out <- optim(start[i,], obj.ei, method="L-BFGS-B", 
+      lower=0, upper=1, gpi=gpi, pred=pred, fmin=fmin)
+    xnew[i,] <- c(out$par, -out$value)
+  }
+  solns <- data.frame(cbind(start, xnew))
+  
+  # give names depend on dimension
+  NAMES <- rep("null", 2*dim + 1)
+  for(i in 1:dim) {
+    NAMES[i] <- paste0("s", i)
+    NAMES[dim + i] <- paste0("x", i)
+  }
+  NAMES[length(NAMES)] <- "val"
+  
+  names(solns) <- NAMES
+  solns <- solns[solns$val > tol,]
+  return(solns)
+}
+
+# PI.search
+PI.search <- function(X, y, dim, gpi, pred=predGPsep, multi.start=5, tol=eps)
+ {
+  m <- which.min(y)
+  fmin <- y[m]
+  start <- matrix(X[m,], nrow=1)
+  if(multi.start > 1) 
+    start <- rbind(start, randomLHS(multi.start - 1, ncol(X)))
+  xnew <- matrix(NA, nrow=nrow(start), ncol=ncol(X)+1)
+  for(i in 1:nrow(start)) {
+    if(PI(gpi, start[i,], fmin) <= tol) { out <- list(value=-Inf); next }
+    out <- optim(start[i,], obj.pi, method="L-BFGS-B", 
+      lower=0, upper=1, gpi=gpi, pred=pred, fmin=fmin)
+    xnew[i,] <- c(out$par, -out$value)
+  }
+  solns <- data.frame(cbind(start, xnew))
+  
+  # give names depend on dimension
+  NAMES <- rep("null", 2*dim + 1)
+  for(i in 1:dim) {
+    NAMES[i] <- paste0("s", i)
+    NAMES[dim + i] <- paste0("x", i)
+  }
+  NAMES[length(NAMES)] <- "val"
+  
+  names(solns) <- NAMES
+  solns <- solns[solns$val > tol,]
+  return(solns)
+}
+
+## bset-of-value function
+bov <- function(y, end=length(y))
+ {
+  prog <- rep(min(y), end)
+  prog[1:min(end, length(y))] <- y[1:min(end, length(y))]
+  for(i in 2:end) 
+    if(is.na(prog[i]) || prog[i] > prog[i-1]) prog[i] <- prog[i-1]
+  return(prog)
+ }
+```
+
+In the next phase, I will implement steps 2, 3, and 4 while modularizing these functions to ensure brevity. Additionally, I will modify the `EI.search` and `PI.search` functions to make them suitable for problem 2.
+```{r optim_funcs}
+optim.ey <- function(X, y, dim, gpi)
+{
+  m <- which.min(y)
+  xnew <- optim(X[m,], obj.mean, lower=0, upper=1, 
+                method="L-BFGS-B", gpi=gpi)$par
+  
+  return(xnew)
+}
+
+# TS doesn't need X, y, we just write this for united.
+optim.tsa <- function(X, y, dim, gpi)
+ {
+  # Generate candidate points and their values
+  candidate_points <- randomLHS(100, dim)
+    
+  # Construct posterior sample (MVN)
+  p <- predGPsep(gpi, candidate_points, nonug=TRUE)
+  samples <- rmvnorm(n=1, mean=p$mean, sigma=p$Sigma)
+    
+  # Find the best candidate and its value
+  m <- which.min(samples)
+  xnew <- candidate_points[m,]
+  
+  return(xnew)
+}
+
+optim.tsb <- function(X, y, dim, gpi)
+{
+  # Generate size-90 candidate points
+  candidate_points <- randomLHS(90, dim)
+    
+  # Find the best five inputs found so far
+  best_five_indices <- order(y)[1:5]
+  best_five_inputs <- X[best_five_indices,]
+  
+  # Determine the smallest rectangle containing the best five inputs
+  lb <- min(best_five_inputs)
+  ub <- max(best_five_inputs)
+  
+  # Generate 10 random candidates within the smallest rectangle
+  additional_candidates <- (ub - lb)*randomLHS(10, dim) + lb
+  
+  # Construct posterior sample
+  p <- predGPsep(gpi, candidate_points, nonug=TRUE)
+  samples <- rmvnorm(n=1, mean=p$mean, sigma=p$Sigma)
+    
+  # Find the best candidate and its value
+  m <- which.min(samples)
+  xnew <- candidate_points[m,]
+  
+  return(xnew)
+}
+
+optim.ei <- function(X, y, dim, gpi)
+{
+  solns <- EI.search(X, y, dim, gpi)
+  m <- which.max(solns$val)
+  xnew <- as.matrix(solns[m,(dim+1):(2*dim)])
+  
+  return(xnew)
+}
+
+optim.pi <- function(X, y, dim, gpi)
+{
+  solns <- PI.search(X, y, dim, gpi)
+  m <- which.max(solns$val)
+  xnew <- as.matrix(solns[m,(dim+1):(2*dim)])
+    
+  return(xnew)
+}
+
+# The original optimization function doesn't use rep for loop
+optim.lb <- function(fprime)
+{
+  os <- optim(runif(2), fprime, lower=0, upper=1, method="L-BFGS-B")
+  return(os)
+}
+
+optim.nm <- function(fprime)
+{
+  os <- optim(runif(2), fprime, method="Nelder-Mead")
+  return(os)
+}
+```
+
+```{r optim.p1}
+optim.p1 <- function(f, fprime, optim.func, ninit, dim=2, end, threshold=1e-5)
+{
+  ## initialization
+  X <- randomLHS(ninit, dim)
+  y <- f(X)
+  da <- darg(list(mle=TRUE, max=0.5), randomLHS(1000, dim))
+  gpi <- newGPsep(X, y, d=da$start, g=1e-6, dK=TRUE)
+  mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+
+  ## if we use 'L-BFGS-B` and 'Nelder-Mead`, we don't need for loop
+  if(identical(optim.func, optim.lb) || identical(optim.func, optim.nm)) {
+    os <- optim.func(fprime)
+    return(os)
+  }
+  
+  ## optimization loop
+  for(i in (ninit + 1):end) {
+    xnew <- optim.func(X=X, y=y, dim=dim, gpi=gpi)
+    ynew <- f(xnew)
+    
+    if(abs(ynew - y[length(y)]) < threshold) break
+    updateGPsep(gpi, matrix(xnew, nrow=1), ynew)
+    mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+    X <- rbind(X, xnew)
+    y <- c(y, ynew)
+  }
+  
+  ## clean up and return
+  deleteGPsep(gpi)
+  return(list(X=X, y=y))
+}
+```
+
+Finally, we complete steps 6, 7, and 8, which involve tracking the `bov` for each comparator in each iteration, calculating the average progress for each comparator across 100 repetitions, and creating boxplots.
+```{r prog_p1}
+## parameters setting
+ninit <- 12
+reps <- 100
+end <- 50
+
+## run optim.p1 and record prog
+prog.ey <- prog.lb <- prog.nm <- prog.tsa <- 
+  prog.tsb <- prog.ei <- prog.pi <- matrix(NA, nrow=reps, ncol=end)
+for(r in 1:reps) {
+  prog.ey[r,] <- bov(optim.p1(f=f, fprime=fprime, optim.func=optim.ey, 
+                              ninit=ninit, end=end)$y, end)
+  prog.tsa[r,] <- bov(optim.p1(f=f, fprime=fprime, optim.func=optim.tsa, 
+                               ninit=ninit, end=end)$y, end)
+  prog.tsb[r,] <- bov(optim.p1(f=f, fprime=fprime, optim.func=optim.tsb, 
+                               ninit=ninit, end=end)$y, end)
+  prog.ei[r,] <- bov(optim.p1(f=f, fprime=fprime, optim.func=optim.ei, 
+                              ninit=ninit, end=end)$y, end)
+  prog.pi[r,] <- bov(optim.p1(f=f, fprime=fprime, optim.func=optim.pi, 
+                              ninit=ninit, end=end)$y, end)
+  
+  # for `L-BFGS-B` and `Nelder-Mead`, we need to use additional vector `y1`
+  y1 <- c()
+  os.lb <- optim.p1(f=f, fprime=fprime, optim.func=optim.lb, ninit=ninit, end=end)
+  prog.lb[r,] <- bov(y1, end)
+
+  y1 <- c() # need to reset y1
+  os.nm <- optim.p1(f=f, fprime=fprime, optim.func=optim.nm, ninit=ninit, end=end)
+  prog.nm[r,] <- bov(y1, end)
+}
+```
+
+```{r plot_p1}
+## plot average bov
+plot(colMeans(prog.ey, na.rm=TRUE), col="black", lwd=2, type="l", ylim=c(-3.2, 0.5),
+     xlab="n: blackbox evaluations", ylab="average best valid value")
+lines(colMeans(prog.tsa, na.rm=TRUE), col="gray", lwd=2)
+lines(colMeans(prog.tsb, na.rm=TRUE), col="red", lwd=2)
+lines(colMeans(prog.ei, na.rm=TRUE), col="blue", lwd=2)
+lines(colMeans(prog.pi, na.rm=TRUE), col="green", lwd=2)
+lines(colMeans(prog.lb, na.rm=TRUE), col="purple", lwd=2)
+lines(colMeans(prog.nm, na.rm=TRUE), col="yellow", lwd=2)
+legend("topright", c("EY", "TSa", "TSb", "EI", "PI", "L-BFGS-B", "Nelder-Mead"),
+  col=c("black","gray","red","blue","green","purple","yellow"), lwd=c(2,2,2,2,2,2,2), 
+  lty=c(1,1,1,1,1,1,1), bty="n")
+
+## plot box-plot of bov
+boxplot(prog.ey[,end], prog.tsa[,end], prog.tsb[,end], prog.ei[,end], 
+        prog.pi[,end], prog.lb[,end], prog.nm[,end], names=c("EY", "TSa", "TSb", 
+        "EI", "PI", "L-BFGS-B", "NM"), border=c("black","gray","red","blue", 
+        "green","purple","yellow"), xlab="comparator", ylab="best objective value")
+```
+
+The average progress shows that the L-BFGS-B method performs the worst, while the other six methods have similar performance when n is smaller than 12, since no method is applied on these initial points. Once n is greater than 12, meaning we start using the methods for optimization, the EI method performs the best with the fastest decreasing rate. On the other hand, the Nelder-Mead method performs the worst, which is reasonable since it is also an optim method, similar to L-BFGS-B.
+
+The boxplots also confirm our findings from the average progress: the EI method performs the best with the smallest variance, while the L-BFGS-B method performs the worst.
+
+## 2. Six-dimensional problem
+
+Problem 2 is identical to problem 1, except we replace the Goldstein-Price function with the Hartman 6 function. To solve this problem, we only need to implement the Hartman 6 function and follow the same steps we did for problem 1.
+```{r hartman6}
+library(DiceOptim)
+
+h <- function(X, lb=0, ub=1, inf=1e6)
+{
+  if(is.null(nrow(X))) X <- matrix(X, nrow=1)
+  h <- apply(X, 1, hartman6)
+  
+  # add penalty term
+  if (any(X < lb) || any(X > ub)) {
+    return(inf)
+  } else {
+    return(h)
+  }
+}
+
+# hprime
+hprime <- function(x)
+ {
+  ynew <- h(x)
+  y1 <<- c(y1, ynew)
+  return(ynew)
+ }
+```
+
+```{r prog_p2}
+## parameters setting
+dim <- 6
+
+## run optim.p1 and record prog on problem 2
+prog.ey <- prog.lb <- prog.nm <- prog.tsa <- 
+  prog.tsb <- prog.ei <- prog.pi <- matrix(NA, nrow=reps, ncol=end)
+for(r in 1:reps) {
+  prog.ey[r,] <- bov(optim.p1(f=h, fprime=hprime, optim.func=optim.ey, 
+                              ninit=ninit, dim=dim, end=end)$y, end)
+  prog.tsa[r,] <- bov(optim.p1(f=h, fprime=hprime, optim.func=optim.tsa, 
+                               ninit=ninit, dim=dim, end=end)$y, end)
+  prog.tsb[r,] <- bov(optim.p1(f=h, fprime=hprime, optim.func=optim.tsb, 
+                               ninit=ninit, dim=dim, end=end)$y, end)
+  prog.ei[r,] <- bov(optim.p1(f=h, fprime=hprime, optim.func=optim.ei, 
+                              ninit=ninit, dim=dim, end=end)$y, end)
+  prog.pi[r,] <- bov(optim.p1(f=h, fprime=hprime, optim.func=optim.pi, 
+                              ninit=ninit, dim=dim, end=end)$y, end)
+  
+  # for `L-BFGS-B` and `Nelder-Mead`, we need to use additional vector `y1`
+  y1 <- c()
+  os.lb <- optim.p1(f=h, fprime=hprime, optim.func=optim.lb, ninit=ninit, 
+                    dim=dim, end=end)
+  prog.lb[r,] <- bov(y1, end)
+
+  y1 <- c() # need to reset y1
+  os.nm <- optim.p1(f=h, fprime=hprime, optim.func=optim.nm, ninit=ninit, 
+                    dim=dim, end=end)
+  prog.nm[r,] <- bov(y1, end)
+}
+```
+
+```{r plot_p2}
+## plot average bov
+plot(colMeans(prog.ey, na.rm=TRUE), col="black", lwd=2, type="l", ylim=c(-3.2, 0.5),
+     xlab="n: blackbox evaluations", ylab="average best valid value")
+lines(colMeans(prog.tsa, na.rm=TRUE), col="gray", lwd=2)
+lines(colMeans(prog.tsb, na.rm=TRUE), col="red", lwd=2)
+lines(colMeans(prog.ei, na.rm=TRUE), col="blue", lwd=2)
+lines(colMeans(prog.pi, na.rm=TRUE), col="green", lwd=2)
+lines(colMeans(prog.lb, na.rm=TRUE), col="purple", lwd=2)
+lines(colMeans(prog.nm, na.rm=TRUE), col="yellow", lwd=2)
+legend("topright", c("EY", "TSa", "TSb", "EI", "PI", "L-BFGS-B", "Nelder-Mead"),
+  col=c("black","gray","red","blue","green","purple","yellow"), lwd=c(2,2,2,2,2,2,2), 
+  lty=c(1,1,1,1,1,1,1), bty="n")
+
+## plot box-plot of bov
+boxplot(prog.ey[,end], prog.tsa[,end], prog.tsb[,end], prog.ei[,end], 
+        prog.pi[,end], prog.lb[,end], prog.nm[,end], names=c("EY", "TSa", "TSb", 
+        "EI", "PI", "L-BFGS-B", "NM"), border=c("black","gray","red","blue", 
+        "green","purple","yellow"), xlab="comparator", ylab="best objective value")
+```
+
+The observations from the average progress and boxplots for problem 2 are similar to those for problem 1, with the EI method performing the best and optim methods performing the worst. One notable difference is that the performance of EY is closer to that of EI in problem 2 compared to problem 1.
+
+Overall, these results suggest that the EI method is efficient for optimization problems, even in high-dimensional cases. However, as the dimensionality increases, the performance of EY also improves and approaches that of EI.
+
+
+## 5. An old friend
+I also list basic steps of problem 5 for clarity:
+
+1. Define the `Goldstein-Price` function and the sinusoidal constraint as the objective function with constraint.
+
+2. Initialize a small `LHS` of size 10 for the input space.
+
+3. Create a modular implementation that can handle both EFI (`optim.efi`) and augmented Lagrangian (`optim.auglag`) optimization methods provided by `laGP`.
+
+4. For the augmented Lagrangian method, implement both EY (`ey.tol=1`) and EI variations, with and without slack variables.
+
+5. Run the optimization process for a total of 50 acquisitions after initialization, using `start=10` and `end=60` as arguments.
+
+6. Perform 30 or more runs of the optimization process, considering the random nature of initialization, to explore variability.
+
+7. For each run, track the best valid value (`bvv`) of the objective over the iterations.
+
+8. Calculate the average `bvv` over the repetitions for each optimization method.
+
+9. Report the full distribution of `bvv` after the last acquisition for each method.
+
+I implement all required codes in the following.
+```{r aimprob}
+# update Goldstein-Price without bounding
+f <- function(X, lb=0, ub=1, inf=1e6)
+{
+  if(is.null(nrow(X))) X <- matrix(X, nrow=1)
+  m <- 8.6928
+  s <- 2.4269
+  x1 <- 4*X[,1] - 2
+  x2 <- 4*X[,2] - 2
+  a <- 1 + (x1 + x2 + 1)^2 * 
+    (19 - 14*x1 + 3*x1^2 - 14*x2 + 6*x1*x2 + 3*x2^2)
+  b <- 30 + (2*x1 - 3*x2)^2 * 
+    (18 - 32*x1 + 12*x1^2 + 48*x2 - 36*x1*x2 + 27*x2^2)
+  f <- log(a*b)
+  f <- (f - m)/s
+}
+
+# Goldstein-Price with sin constraints
+aimprob <- function(X, known.only=FALSE)
+{
+  if(is.null(nrow(X))) X <- matrix(X, nrow=1)
+  obj <- f(X)
+  if(known.only) return(list(obj=obj))
+  c1 <- 1.5 - X[,1] - 2*X[,2] - 0.5*sin(2*pi*(X[,1]^2 - 2*X[,2]))
+
+  return(list(obj=obj, c=drop(c1)))
+}
+```
+
+```{r optim.p5}
+optim.p5 <- function(reps, optim_func, aimprob, B, start=10, 
+                     end=60, slack=FALSE, ey.tol=1e-2, verb=0)
+{
+  prog <- matrix(NA, nrow=reps, ncol=end)
+  for(r in 1:reps) {
+    res <- optim.auglag(aimprob, B, start=10, end=60, slack=2, verb=0)
+    prog[r,] <- res$prog
+  }
+  return(prog)
+}
+```
+
+```{r bvv}
+reps <- 30
+B <- matrix(c(rep(0,2), rep(1,2)), ncol=2)
+
+prog.efi <- optim.p5(reps, optim.efi, aimprob, B)
+prog.eynew <- optim.p5(reps, optim.auglag, aimprob, B, ey.tol=1)
+prog.ei.mc <- optim.p5(reps, optim.auglag, aimprob, B)
+prog.ei.sl <- optim.p5(reps, optim.auglag, aimprob, B, slack=TRUE)
+prog.ei.slopt <- optim.p5(reps, optim.auglag, aimprob, B, slack=2)
+```
+```{r plot_p5}
+# plot average bvv and final distribution
+plot(colMeans(prog.efi, na.rm=TRUE), col="black", lwd=2, type="l", 
+  xlab="n: blackbox evaluations", ylab="average best valid value")
+lines(colMeans(prog.eynew, na.rm=TRUE), col="gray", lwd=2)
+lines(colMeans(prog.ei.mc, na.rm=TRUE), col="red", lwd=2)
+lines(colMeans(prog.ei.sl, na.rm=TRUE), col="blue", lwd=2)
+lines(colMeans(prog.ei.slopt, na.rm=TRUE), col="green", lwd=2)
+legend("topright", c("EFI", "EY", "MC", "Slack_TRUE", "Slack_2"),
+  col=c("black","gray","red","blue","green"), lwd=c(2,2,2,2,2), lty=c(1,1,1,1,1),
+  bty="n")
+```
+
+Based on the average `bvv`, we can see that all five methods perform similarly, with `MC` and `EY` showing slightly better performance. The convergence of all methods occurs at around `n=20`.
+
+```{r histogram}
+# Set up a 2x3 grid for the plots
+par(mfrow = c(2, 3))
+
+# Plot the histograms
+hist(prog.efi[, 60], main = "EFI", xlab = "best valid value")
+hist(prog.eynew[, 60], main = "EY", xlab = "best valid value")
+hist(prog.ei.mc[, 60], main = "EI MC", xlab = "best valid value")
+hist(prog.ei.sl[, 60], main = "EI SL", xlab = "best valid value")
+hist(prog.ei.slopt[, 60], main = "EI SLOPT", xlab = "best valid value")
+```
+
+
+
+
+
+
+
+
+

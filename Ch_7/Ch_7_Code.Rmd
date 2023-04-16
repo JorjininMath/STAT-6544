@@ -1,0 +1,695 @@
+---
+title: "Chapter 7"
+author: "Jin Zhao"
+date: "2023-04-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Chapter 7
+## 7.1 Surrogate-assisted optimization
+### 7.1.1 A running example
+
+```{r Goldstein-Price}
+f <- function(X)
+{
+  if(is.null(nrow(X))) X <- matrix(X, nrow=1)
+  m <- 8.6928
+  s <- 2.4269
+  x1 <- 4*X[,1] - 2
+  x2 <- 4*X[,2] - 2
+  a <- 1 + (x1 + x2 + 1)^2 * 
+    (19 - 14*x1 + 3*x1^2 - 14*x2 + 6*x1*x2 + 3*x2^2)
+  b <- 30 + (2*x1 - 3*x2)^2 * 
+    (18 - 32*x1 + 12*x1^2 + 48*x2 - 36*x1*x2 + 27*x2^2)
+  f <- log(a*b)
+  f <- (f - m)/s
+  return(f)
+}
+```
+
+Begin with a small space-filling Latin hypercube sample seed design in 2d.
+```{r lhs}
+library(lhs)
+n_init <- 12
+X <- randomLHS(n_init, 2)
+y <- f(X)
+```
+
+Next fit a separable GP to those data, with a small nugget for jitter. To help create a prior on $\theta$ that’s more stable, `darg` below utilizes a large auxiliary pseudo-design in lieu of `X`, which at early stages of design/optimization (n0 = 12 runs) may not yet possess a sufficient diversity of pairwise distances.
+```{r auxiliary pseudo-design in lieu of X}
+
+# darg: calculates a Gaussian distance matrix between all pairs of X rows, or a subsample of rows of size `samp.size`. From those distances it chooses the range and start values from the range of (non-zero) distances and the 0.1 quantile, respectively.
+# output: mle, start (starting value chosedn from the quantiles of distance(X) or (y - mean(y)))^2, min, max, ab (shape and rate parameters specifying a Gaussian prior for the parameter).
+
+library(laGP)
+da <- darg(list(mle=TRUE, max=0.5), randomLHS(1000, 2))
+gpi <- newGPsep(X, y, d=da$start, g=1e-6, dK=TRUE)
+mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)$msg
+```
+
+Just like our ALM/C searches, consider an objective based on GP predictive equations. This represents an implementation of Step 3 in Algorithm 6.1 for sequential design/active learning, setting EY as sequential design criterion $J(x)$, or defining the acquisition function in ML jargon.
+```{r obj}
+obj.mean <- function(x, gpi)
+  predGPsep(gpi, matrix(x, nrow=1), lite=TRUE)$mean
+```
+
+Now the predictive mean surface (like $f$, through the evaluations it’s trained on) may have many local minima, but let’s punt for now on the ideal of global optimization of EY – of the so-called “inner loop” – and see where we get with a search initialized at the current best value. R code below extracts that value: `m` indexing the best `y`-value obtained so far, and uses its $x$ coordinates to initialize a `L-BFGS-B` solver on `obj.mean`
+```{r opt}
+m <- which.min(y)
+opt <- optim(X[m, ], obj.mean, lower=0, upper=1, method="L-BFGS-B", gpi=gpi)
+opt$par
+```
+
+So this is the next point to try. Surrogate optima represent a sensible choice for the next evaluation of the expensive blackbox, or so the thinking goes.
+
+```{r plot_1}
+plot(X[1:n_init,], xlab="x1", ylab="x2", xlim=c(0,1), ylim=c(0,1))
+arrows(X[m,1], X[m,2], opt$par[1], opt$par[2], length=0.1)
+```
+
+Now evaluate $f$ at `opt$par`, update the GP and its hyperparameters ...
+```{r update_f}
+y_new <- f(opt$par)
+updateGPsep(gpi, matrix(opt$par, nrow=1), y_new)
+mle <- mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+X <- rbind(X, opt$par)
+y <- c(y, y_new)
+```
+
+and solve for the next point
+```{r solve_next_point}
+m <- which.min(y)
+opt <- optim(X[m,], obj.mean, lower=0, upper=1, method="L-BFGS-B", gpi=gpi)
+opt$par
+```
+
+```{r plot_2}
+plot(X, xlab="x1", ylab="x2", xlim=c(0,1), ylim=c(0,1))
+arrows(X[m,1], X[m,2], opt$par[1], opt$par[2], length=0.1)
+```
+
+If the origin of the new arrow resides at the newly minted open circle, then we have progress: the predictive mean surface was accurate and indeed helpful in finding a new best point, minimizing $f$. If not, then the origin is back at the same open circle it originated from before.
+
+Now incorporate the new point into our dataset and update the GP predictor.
+
+```{r update_new}
+y_new <- f(opt$par)
+updateGPsep(gpi, matrix(opt$par, nrow=1), y_new)
+mle <- mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+X <- rbind(X, opt$par)
+y <- c(y, y_new)
+```
+
+Let’s fast-forward a little bit. Code below wraps what we’ve been doing above into a `while` loop with a simple check on convergence in order to “break out”. If two outputs in a row are sufficiently close, within a tolerance `1e-4`, then stop. That’s quite crude, but sufficient for illustrative purposes.
+
+```{r wrap_up_search}
+while(1){
+  m <- which.min(y)
+  opt <- optim(X[m,], obj.mean, lower=0, upper=1, method="L-BFGS-B", gpi=gpi)
+  y_new <- f(opt$par)
+  if(abs(y_new - y[length(y)]) < 1e-4) break
+  updateGPsep(gpi, matrix(opt$par, nrow=1), y_new)
+  mle <- mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+  X <- rbind(X, opt$par)
+  y <- c(y, y_new)
+}
+deleteGPsep(gpi)
+```
+
+To help measure progress, code below implements some post-processing to track the best `y`-value (`bov`: best objective value) over those iterations. The function is written in some generality in order to accommodate application in several distinct settings, coming later.
+```{r bov}
+bov <- function(y, end=length(y))
+ {
+  prog <- rep(min(y), end)
+  prog[1:min(end, length(y))] <- y[1:min(end, length(y))]
+  for(i in 2:end) 
+    if(is.na(prog[i]) || prog[i] > prog[i-1]) prog[i] <- prog[i-1]
+  return(prog)
+ }
+```
+
+```{r prog}
+prog <- bov(y)
+```
+
+```{r plot_3}
+plot(prog, type="l", col="gray", xlab="n: blackbox evaluations", 
+  ylab="best objective value")
+# add one or more straight lines through the current plot.
+abline(v=n_init, lty=2)
+legend("topright", "seed LHS", lty=2, bty="n")
+```
+
+To better explore diversity in progress over repeated trials with different random seed designs, an R function below encapsulates our code from above. In addition to a tolerance on successive `y`-values, an `end` argument enforces a maximum number of iterations. The full dataset of inputs `X` and evaluations `y` is returned.
+```{r optim_fun}
+optim.surr <- function(f, m, n_init, end, tol=1e-4)
+ {
+  ## initialization
+  X <- randomLHS(n_init, m)
+  y <- f(X)
+  da <- darg(list(mle=TRUE, max=0.5), randomLHS(1000, m))
+  gpi <- newGPsep(X, y, d=da$start, g=1e-6, dK=TRUE)
+  mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+
+  ## optimization loop
+  for(i in (n_init+1):end) {
+    m <- which.min(y)
+    opt <- optim(X[m,], obj.mean, lower=0, upper=1, 
+      method="L-BFGS-B", gpi=gpi)
+    y_new <- f(opt$par)
+    if(abs(y_new - y[length(y)]) < tol) break
+    updateGPsep(gpi, matrix(opt$par, nrow=1), y_new)
+    mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+    X <- rbind(X, opt$par)
+    y <- c(y, y_new)
+  }
+
+  ## clean up and return
+  deleteGPsep(gpi)
+  return(list(X=X, y=y))
+ }
+```
+
+Consider re-seeding and re-solving the optimization problem, minimizing `f`, in this way over 100 Monte Carlo (MC) repetitions. The loop below combines calls to `optim.surr` with `prog` post-processing. A maximum number of `end=50` iterations is allowed, but often convergence is signaled after many fewer acquisitions.
+
+```{r MC_rep}
+reps <- 100
+end <- 50
+prog <- matrix(NA, nrow=reps, ncol=end)
+for(r in 1:reps) {
+  os <- optim.surr(f, 2, n_init, end)
+  prog[r,] <- bov(os$y, end)
+}
+```
+
+```{r plot_4}
+matplot(t(prog), type="l", col="gray", lty=1, 
+  xlab="n: blackbox evaluations",  ylab="best objective value")
+abline(v=n_init, lty=2)
+legend("topright", "seed LHS", lty=2, bty="n")
+```
+
+
+### 7.1.2 A classical comparator
+Code below modifies our objective function to help keep track of the full set of `y`-values gathered over optimization iterations, as these are not saved by `optim` in a way that’s useful for backing out a progress meter (e.g., `prog`) for comparison. (The `optim` method works just fine, but it was not designed with my illustrative purpose in mind. It wants to iterate to convergence and give the final result rather than bother you with the details of each evaluation. A `trace` argument prints partial evaluation information to the screen, but doesn’t return those values for later use.) So the code below updates a `y` object stored in the calling environment.
+```{r fprime}
+fprime <- function(x)
+{
+  y_new <- f(x)
+  y <<- c(y, y_new)
+  return(y_new)
+}
+```
+
+Below is the same for loop we did for EY-based surrogate-assisted optimization, but with a direct `optim` instead.
+```{r for_new}
+prog.optim <- matrix(NA, nrow=reps, ncol=end)
+for(r in 1:reps){
+  y <- c()
+  os <- optim(runif(2), fprime, lower=0, upper=1, method="L-BFGS-B")
+  prog.optim[r,] <- bov(y, end)
+}
+
+# compare with EY
+matplot(t(prog.optim), type="l", col="red", lty=1, 
+  xlab="n: blackbox evaluations", ylab="best objective value")
+matlines(t(prog), type="l", col="gray", lty=1)
+legend("topright", c("EY", "optim"), col=c("gray", "red"), lty=1, bty="n")
+```
+
+
+## 7.2 Expected improvement
+### 7.2.1 Classic EI illustration
+
+```{r first_EI}
+x <- c(1, 2, 3, 4, 12)
+y <- c(0, -1.75, -2, -0.5, 5)
+
+gpi <- newGP(matrix(x, ncol=1), y, d=10, g=1e-8)
+xx <- seq(0, 13, length=1000)
+p <- predGP(gpi, matrix(xx, ncol=1), lite=TRUE)
+
+# Calculate EI
+m <- which.min(y)
+fmin <- y[m]
+d <- fmin - p$mean              # f_min - \mu_n
+s <- sqrt(p$s2)                 # sigma_n
+dn <- d/s 
+ei <- d*pnorm(dn) + s*dnorm(dn) # Eq 7.3
+
+# plot
+par(mfrow=c(1,2))
+plot(x, y, pch=19, xlim=c(0,13), ylim=c(-4,9), main="predictive surface")
+lines(xx, p$mean)
+lines(xx, p$mean + 2*sqrt(p$s2), col=2, lty=2)
+lines(xx, p$mean - 2*sqrt(p$s2), col=2, lty=2)
+abline(h=fmin, col=3, lty=3)
+legend("topleft", c("mean", "95% PI", "fmin"), lty=1:3, 
+  col=1:3, bty="n")
+plot(xx, ei, type="l", col="blue", main="EI", xlab="x", ylim=c(0,0.15))
+```
+
+R code below makes a more precise selection and incorporates the new pair $(x_{n+1}, y_{n+1})$.
+```{r precise_selection}
+mm <- which.max(ei)
+x <- c(x, xx[mm])
+y <- c(y, p$mean[mm])
+
+# update GP
+updateGP(gpi, matrix(xx[mm], ncol=1), p$mean[mm])
+p <- predGP(gpi, matrix(xx, ncol=1), lite=TRUE)
+deleteGP(gpi)
+
+# convert those predictions into EIs based on new f_min
+m <- which.min(y)
+fmin <- y[m]
+d <- fmin - p$mean
+s <- sqrt(p$s2)
+dn <- d/s
+ei <- d*pnorm(dn) + s*dnorm(dn)
+
+# update predictive surface and EI criterion
+par(mfrow=c(1,2))
+plot(x, y, pch=19, xlim=c(0,13), ylim=c(-4,9), main="predictive surface")
+lines(xx, p$mean)
+lines(xx, p$mean + 2*sqrt(p$s2), col=2, lty=2)
+lines(xx, p$mean - 2*sqrt(p$s2), col=2, lty=2)
+abline(h=fmin, col=3, lty=3)
+legend("topleft", c("mean", "95% PI", "fmin"), lty=1:3, 
+  col=1:3, bty="n")
+plot(xx, ei, type="l", col="blue", main="EI", xlab="x", ylim=c(0,0.15))
+```
+
+### 7.2.2 EI on our running example
+```{r EI}
+EI <- function(gpi, x, fmin, pred=predGPsep)
+ {
+  if(is.null(nrow(x))) x <- matrix(x, nrow=1)
+  p <- pred(gpi, x, lite=TRUE)
+  d <- fmin - p$mean
+  sigma <- sqrt(p$s2)
+  dn <- d/sigma
+  ei <- d*pnorm(dn) + sigma*dnorm(dn)
+  return(ei)
+ }
+```
+```{r obg_EI}
+obj.EI <- function(x, fmin, gpi, pred=predGPsep)
+  -EI(gpi, x, fmin, pred)
+```
+
+```{r EI.search}
+eps <- sqrt(.Machine$double.eps) ## used lots below
+
+EI.search <- function(X, y, gpi, pred=predGPsep, multi.start=5, tol=eps)
+ {
+  m <- which.min(y)
+  fmin <- y[m]
+  start <- matrix(X[m,], nrow=1)
+  if(multi.start > 1) 
+    start <- rbind(start, randomLHS(multi.start - 1, ncol(X)))
+  xnew <- matrix(NA, nrow=nrow(start), ncol=ncol(X)+1)
+  for(i in 1:nrow(start)) {
+    if(EI(gpi, start[i,], fmin) <= tol) { out <- list(value=-Inf); next }
+    out <- optim(start[i,], obj.EI, method="L-BFGS-B", 
+      lower=0, upper=1, gpi=gpi, pred=pred, fmin=fmin)
+    xnew[i,] <- c(out$par, -out$value)
+  }
+  solns <- data.frame(cbind(start, xnew))
+  names(solns) <- c("s1", "s2", "x1", "x2", "val")
+  solns <- solns[solns$val > tol,]
+  return(solns)
+}
+```
+
+All right, let’s initialize an EI-based optimization – same as for the two earlier comparators.
+```{r EI_optim}
+ninit <- 12
+X <- randomLHS(ninit, 2)
+y <- f(X)
+gpi <- newGPsep(X, y, d=0.1, g=1e-6, dK=TRUE)
+da <- darg(list(mle=TRUE, max=0.5), randomLHS(1000, 2))
+
+# next input to try
+solns <- EI.search(X, y, gpi)
+m <- which.max(solns$val)
+maxei <- solns$val[m]
+
+# plot
+plot(X, xlab="x1", ylab="x2", xlim=c(0,1), ylim=c(0,1))
+arrows(solns$s1, solns$s2, solns$x1, solns$x2, length=0.1)
+points(solns$x1[m], solns$x2[m], col=2, pch=20)
+```
+
+Moving on now, code below incorporates the new data at the chosen input location (red dot) and updates the GP fit.
+```{r, incoporate}
+xnew <- as.matrix(solns[m,3:4])
+X <- rbind(X, xnew)
+y <- c(y, f(xnew))
+updateGPsep(gpi, xnew, y[length(y)])
+mle <- mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+
+# second update
+solns <- EI.search(X, y, gpi)
+m <- which.max(solns$val)
+maxei <- c(maxei, solns$val[m])
+xnew <- as.matrix(solns[m,3:4])
+X <- rbind(X, xnew)
+y <- c(y, f(xnew))
+updateGPsep(gpi, xnew, y[length(y)])
+mle <- mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+
+# plot
+plot(X, xlab="x1", ylab="x2", xlim=c(0,1), ylim=c(0,1))
+arrows(solns$s1, solns$s2, solns$x1, solns$x2, length=0.1)
+points(solns$x1[m], solns$x2[m], col=2, pch=20)
+```
+
+You get the idea. Rather than continue with pedantic visuals, a for loop below repeats in this way until fifty samples of $f$ have been collected. Hopefully one of them will offer a good solution to the optimization problem, an $x^{*}$ with a minimal objective value $f(x^{*})$.
+```{r wrapup_EI}
+for(i in nrow(X):end) {
+  solns <- EI.search(X, y, gpi)
+  m <- which.max(solns$val)
+  maxei <- c(maxei, solns$val[m])
+  xnew <- as.matrix(solns[m,3:4])
+  ynew <- f(xnew)
+  X <- rbind(X, xnew)
+  y <- c(y, ynew)
+  updateGPsep(gpi, xnew, y[length(y)])
+  mle <- mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+}
+deleteGPsep(gpi)
+
+# prog
+prog.ei <- bov(y)
+```
+```{r plot_EI}
+# plot
+par(mfrow=c(1,2))
+plot(prog.ei, type="l", xlab="n: blackbox evaluations", 
+  ylab="EI best observed value")
+abline(v=ninit, lty=2)
+legend("topright", "ninit", lty=2)
+plot(ninit:end, maxei, type="l",  xlim=c(1,end), 
+  xlab="n: blackbox evaluations", ylab="max EI")
+abline(v=ninit, lty=2)
+```
+
+The function below, designed to encapsulate code above for repeated calls in an MC setting, demands an `end` argument in lieu of more automatic convergence criteria.
+
+```{r encapsulate_EI}
+optim.EI <- function(f, ninit, end)
+ {
+  ## initialization
+  X <- randomLHS(ninit, 2)
+  y <- f(X)
+  gpi <- newGPsep(X, y, d=0.1, g=1e-6, dK=TRUE)
+  da <- darg(list(mle=TRUE, max=0.5), randomLHS(1000, 2))
+  mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+    
+  ## optimization loop of sequential acquisitions
+  maxei <- c()
+  for(i in (ninit+1):end) {
+    solns <- EI.search(X, y, gpi)
+    m <- which.max(solns$val)
+    maxei <- c(maxei, solns$val[m])
+    xnew <- as.matrix(solns[m,3:4])
+    ynew <- f(xnew)
+    updateGPsep(gpi, xnew, ynew)
+    mleGPsep(gpi, param="d", tmin=da$min, tmax=da$max, ab=da$ab)
+    X <- rbind(X, xnew)
+    y <- c(y, ynew)
+  }
+
+  ## clean up and return
+  deleteGPsep(gpi)
+  return(list(X=X, y=y, maxei=maxei))
+ }
+```
+
+```{r EI_100}
+reps <- 100
+prog.ei <- matrix(NA, nrow=reps, ncol=end)
+for(r in 1:reps) {
+  os <- optim.EI(f, ninit, end)
+  prog.ei[r,] <- bov(os$y)
+}
+```
+```{r plot_avg}
+# show average bov
+plot(colMeans(prog.ei), col=1, lwd=2, type="l", 
+  xlab="n: blackbox evaluations", ylab="average best objective value")
+lines(colMeans(prog), col="gray", lwd=2)
+lines(colMeans(prog.optim, na.rm=TRUE), col=2, lwd=2)
+abline(v=ninit, lty=2)
+legend("topright", c("optim", "EY", "EI", "seed LHS"), 
+  col=c(2, "gray", 1, 1), lwd=c(2,2,2,1), lty=c(1,1,1,2), 
+  bty="n")
+```
+
+```{r boxplot_avg}
+boxplot(prog.ei[,end], prog[,end], prog.optim[,end], 
+  names=c("EI", "EY", "optim"), border=c("black", "gray", "red"), 
+  xlab="comparator", ylab="best objective value")
+```
+
+### 7.2.3
+
+### 7.2.4 Noisy objectives
+
+### 7.2.5 Illustrating conditional improvement and noise
+```{r fsindn}
+fsindn <- function(x)
+ sin(x) - 2.55*dnorm(x,1.6,0.45)
+X <- matrix(c(0, 0.3, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5,
+  2.8, 3.1, 3.4, 3.7, 4.4, 5.3, 5.7, 6.1, 6.5, 7), ncol=1)
+y <- fsindn(X) + rnorm(length(X), sd=0.15)
+```
+```{r init_jmle}
+library(laGP)
+library(plgp)
+gpi <- newGP(X, y, d=0.1, g=0.1*var(y), dK=TRUE)
+mle <- jmleGP(gpi)
+
+XX <- matrix(seq(0, 7, length=201), ncol=1)
+pY <- predGP(gpi, XX, lite=TRUE)
+pf <- predGP(gpi, XX, lite=TRUE, nonug=TRUE)
+
+plot(X, y, xlab="x", ylab="y", ylim=c(-1.6,0.6), xlim=c(0,7.5))
+lines(XX, pY$mean)
+lines(XX, pY$mean + 1.96*sqrt(pY$s2), col=2, lty=2)
+lines(XX, pY$mean - 1.96*sqrt(pY$s2), col=2, lty=2)
+lines(XX, pf$mean + 1.96*sqrt(pf$s2), col=3, lty=3)
+lines(XX, pf$mean - 1.96*sqrt(pf$s2), col=3, lty=3)
+legend("bottomright", c("Y-bars", "f-bars"), col=2:4, lty=2:3, bty="n")
+```
+
+```{r EIECI}
+fmin <- min(predGP(gpi, X, lite=TRUE)$mean)
+ei <- EI(gpi, XX, fmin, pred=predGP)
+ieci <- ieciGP(gpi, XX, fmin)
+predGPnonug <- predGP
+formals(predGPnonug)$nonug <- TRUE
+ei.f <- EI(gpi, XX, fmin, pred=predGPnonug)
+ieci.f <- ieciGP(gpi, XX, fmin, nonug=TRUE)
+
+# rescale
+ei <- scale(ei, min(ei), max(ei) - min(ei))
+ei.f <- scale(ei.f, min(ei.f), max(ei.f) - min(ei.f))
+ieci <- scale(ieci, min(ieci), max(ieci) - min(ieci))
+ieci.f <- scale(ieci.f, min(ieci.f), max(ieci.f) - min(ieci.f))
+```
+```{r plot_EIECI}
+plot(XX, ei, type="l", ylim=c(0, 1), xlim=c(0,7.5), col=2, lty=1, 
+  xlab="x", ylab="improvements")
+lines(XX, ei.f, col=3, lty=1)
+points(X, rep(0, nrow(X)))
+lines(XX, 1-ieci, col=2, lty=2)
+lines(XX, 1-ieci.f, col=3, lty=2)
+legend("topright", c("EI", "EI-f", "IECI", "IECI-f"), lty=c(1,1,2,2), 
+  col=c(2,3,2,3), bty="n")
+```
+
+
+## 7.3 Optimization under constraints
+### 7.3.1 Known constraints
+
+```{r Ex_constraints}
+X <- matrix(c(0, 0.3, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 4.4, 5.3, 5.7,
+  6.1, 6.5, 7), ncol=1)
+y <- fsindn(X) + rnorm(length(X), sd=0.15)
+
+gpi <- newGP(X, y, d=5, g=0.1*var(y), dK=TRUE)
+
+XX <- matrix(seq(0, 7, length=201), ncol=1)
+p <- predGP(gpi, XX, lite=TRUE)
+
+plot(X, y, xlab="x", ylab="y", ylim=c(-3.25, 0.7))
+lines(XX, p$mean)
+lines(XX, p$mean + 1.96*sqrt(p$s2), col=2, lty=2)
+lines(XX, p$mean - 1.96*sqrt(p$s2), col=2, lty=2)
+```
+
+```{r EFI}
+fmin <- min(predGP(gpi, X, lite=TRUE)$mean)
+ei <- EI(gpi, XX, fmin, pred=predGPnonug)
+ei <- scale(ei, min(ei), max(ei) - min(ei))
+
+lc <- 2
+rc <- 4
+eiref <- c(ei[XX < lc], ei[XX > rc])
+
+Xref <- matrix(c(XX[XX < lc,], XX[XX > rc,]), ncol=1)
+
+ieci <- ieciGP(gpi, XX, fmin, Xref=Xref, nonug=TRUE)
+ieci <- scale(ieci, min(ieci), max(ieci) - min(ieci))
+
+# plot
+plot(XX, ei, type="l", ylim=c(0, max(ei)), lty=2, xlab="x", 
+  ylab="normalized improvements")
+lines(Xref[Xref < lc], eiref[Xref < lc])
+lines(Xref[Xref > rc], eiref[Xref > rc])
+points(X, rep(0, nrow(X)))
+lines(XX, 1-ieci, col=2, lty=2)
+legend("topright", c("EI", "IECI"), lty=1:2, col=1:2, bty="n")
+abline(v=c(lc,rc), col="gray", lty=2)
+text(lc,0,"]")
+text(rc,0,"[")
+text(seq(lc+.1, rc-.1, length=20), rep(0, 20), rep("/", 20))
+```
+
+### 7.3.3 Real-valued constraints
+```{r aimprob}
+aimprob <- function(X, known.only=FALSE)
+ {
+  if(is.null(nrow(X))) X <- matrix(X, nrow=1)
+  f <- rowSums(X)
+  if(known.only) return(list(obj=f))
+  c1 <- 1.5 - X[,1] - 2*X[,2] - 0.5*sin(2*pi*(X[,1]^2 - 2*X[,2]))
+  c2 <- X[,1]^2 + X[,2]^2 - 1.5
+  return(list(obj=f, c=drop(cbind(c1, c2))))
+ }
+```
+```{r plot_constraints}
+## establishing the macro
+plotprob <- function(blackbox, nl=c(10,20), gn=200)
+ {
+  x <- seq(0, 1, length=gn)
+  X <- expand.grid(x, x)
+  out <- blackbox(as.matrix(X))
+  fv <- out$obj
+  fv[out$c[,1] > 0 | out$c[,2] > 0] <- NA
+  fi <- out$obj
+  fi[!(out$c[,1] > 0 | out$c[,2] > 0)] <- NA
+  plot(0, 0, type="n", xlim=c(0,1), ylim=c(0,1), xlab="x1", ylab="x2")
+  C1 <- matrix(out$c[,1], ncol=gn)
+  contour(x, x, C1, nlevels=1, levels=0, drawlabels=FALSE, add=TRUE, lwd=2)
+  C2 <-  matrix(out$c[,2], ncol=gn)
+  contour(x, x, C2, nlevels=1, levels=0, drawlabels=FALSE, add=TRUE, lwd=2)
+  contour(x, x, matrix(fv, ncol=gn), nlevels=nl[1], 
+    add=TRUE, col="forestgreen")
+  contour(x, x, matrix(fi, ncol=gn), nlevels=nl[2], add=TRUE, col=2, lty=2)
+ }
+
+## visualizing the aimprob surface(s)
+plotprob(aimprob)
+text(rbind(c(0.1954, 0.4044), c(0.7191, 0.1411), c(0, 0.75)), 
+  c("A", "B", "C"), pos=1)
+```
+
+### 7.3.4 Augmented Lagrangian
+```{r ALwrap}
+ALwrap <- function(x, blackbox, B, lambda, rho)
+ {
+  if(any(x < B[,1]) | any(x > B[,2])) return(Inf)
+  fc <- blackbox(x)
+  # AL function L_A
+  al <- fc$obj + lambda %*% fc$c + 
+    rep(1/(2*rho), length(fc$c)) %*% (pmax(0, fc$c))^2
+  evals <<- evals + 1
+  return(al)
+ }
+```
+```{r optim.al}
+ALoptim <- function(blackbox, B, start=runif(ncol(B)), 
+  lambda=rep(0, ncol(B)), rho=1/2, kmax=10, maxit=15)
+ {
+  ## initialize AL wrapper
+  evals <- 0
+  formals(ALwrap)$blackbox <- blackbox
+
+  ## initialize outer loop progress
+  prog <- matrix(NA, nrow=kmax + 1, ncol=nrow(B) + 1) 
+  prog[1,] <- c(start, NA)
+
+  ## "outer loop" iterations
+  for(k in 1:kmax) {
+
+    ## solve subproblem ("inner loop")
+    out <- optim(start, ALwrap, control=list(maxit=maxit), B=B, lambda=lambda, rho=rho)
+
+    ## extract the x^* that was found, and keep track of progress
+    start <- out$par
+    fc <- blackbox(start)
+    prog[k+1,1:ncol(B)] <- start
+    if(all(fc$c <= 0)) prog[k+1,ncol(B)+1] <- fc$obj
+
+    ## update augmented Lagrangian parameters
+    lambda <- pmax(0, lambda + (1/rho)*fc$c)
+    if(any(fc$c > 0)) rho = rho/2
+  }
+
+  ## collect for returning
+  colnames(prog) <- c(paste0("x", 1:ncol(B)), "obj")
+  return(prog)
+}
+```
+
+```{r perform_AL}
+evals <- 0
+B <- matrix(c(rep(0,2), rep(1,2)), ncol=2)
+# prog <- ALoptim(aimprob, B, start=c(0.9, 0.9))
+res.efi <- optim.efi(aimprob, B, start=10, end=60)
+prog <- cbind(res.efi$X, res.efi$obj)
+
+# plot
+plotprob(aimprob)
+text(prog[,1], prog[,2], 1:nrow(prog))
+m <- which.min(prog[,3])
+abline(v=prog[m,1], lty=3, col="gray")
+abline(h=prog[m,2], lty=3, col="gray")
+```
+
+```{r reps}
+reps <- 30
+all.evals <- rep(NA, reps)
+start <- end <- matrix(NA, nrow=reps, ncol=2)
+for(i in 1:reps) {
+  evals <- 0
+  prog <- ALoptim(aimprob, B, kmax=20)
+  start[i,] <- prog[1,-3]
+  m <- which.min(prog[,3])
+  end[i,] <- prog[m,-3]
+  all.evals[i] <- evals
+}
+
+# plot
+plotprob(aimprob)
+arrows(start[,1], start[,2], end[,1], end[,2], length=0.1, col="gray")
+```
+
+
+
+
+
+
+
+
+
+
+
+
